@@ -11,7 +11,8 @@ def f1_score(y_true, y_pred):
     # print("Dice score begin")
     # print('y_pred.shape =', y_pred.shape)
     # print('y_true.shape =', y_true.shape)
-    y_pred_argmax = tf.math.argmax(y_pred, axis=4)
+    y_pred_softmax = tf.nn.softmax(y_pred)
+    y_pred_argmax = tf.math.argmax(y_pred_softmax, axis=4)
     y_pred_onehot = to_categorical(y_pred_argmax, num_classes=6)
     dices = []
     for i in range(6):
@@ -35,28 +36,36 @@ def weight_calc(total_samples, num_classes, current_class_samples):
     return total_samples / (num_classes * current_class_samples)
 
 # TODO: Weighted loss so background voxels do not over-influence learning
+@tf.function
 def weighted_cross_entropy_loss(y_true, y_pred):
 
-    class_freqs = tf.reduce_sum(y_true, axis=[0, 1, 2])  # Counts of each class in the current datum
+    #print(y_true.dtype)
+
+    class_freqs = tf.reduce_sum(y_true, axis=[0, 1, 2, 3])  # Counts of each class in the current datum
     class_freqs = tf.cast(class_freqs, tf.float32)  # Cast to enable mapping to create weights
     n_samples = tf.reduce_sum(class_freqs)  # Sum all class frequencies to get total voxels in each channel
     n_classes = y_true.shape[-1]  # Number of classes = Number of channels (assumes channels last)
-
+    #print('wcel 1')
     # Weights are assigned by inverted importance based on frequency of the class's occurrence in the current datum
     # i.e. commonly occurring class is weighted low and vice versa
     class_weights = tf.map_fn(fn=lambda t: n_samples / (n_classes * t), elems=class_freqs)
+    # Override with hard-coded weights if required
+    class_weights = tf.constant([0, 1, 1, 1.15, 1.5, 2], dtype=tf.float32)
     # Normalize weights to add to 1
     class_weights = tf.divide(class_weights, tf.reduce_sum(class_weights))
-    # Override with hard-coded weights if required
-    # class_weights = tf.constant([0, 0.5, 1, 1.5, 1.75, 2], dtype=tf.float32)
 
+    #print('wcel 2')
     # Create a mask based on multiplication of one-hot label and the weight, for each class, summed together.
     # When this is multiplied against the unweighted loss, the final loss is scaled (weighted) PER voxel,
     # by the class's weight factor.
-    weights_mask = y_true[..., 0] * class_weights[0]
+    weights_mask = tf.cast(y_true[..., 0], tf.float32) * class_weights[0]
+    #print('wcel 3')
     for i in range(1, n_classes):
-        weights_mask = tf.add(weights_mask, y_true[..., i] * class_weights[i])
+
+        weights_mask = tf.add(weights_mask, tf.cast(y_true[..., 0], tf.float32) * class_weights[i])
+        #print('wcel 4{}'.format(i))
         pass
+    #print('wcel 5')
     # Calculate unweighted Cross Entropy loss
     loss = tf.nn.softmax_cross_entropy_with_logits(labels=y_true, logits=y_pred)
     # Return the weighted loss
@@ -92,6 +101,7 @@ class UNetCSIROMalePelvic:
         self.__init = keras.initializers.RandomNormal(stddev=0.02)
         self.__opt = tf.keras.optimizers.Adam(learning_rate=0.0002, beta_1=0.5)
         self.__loss = tf.keras.losses.CategoricalCrossentropy()
+        self.__loss = weighted_cross_entropy_loss
         self.train_batch_count = 0
         # Create Model
         self._create_model(given_name)
@@ -174,8 +184,19 @@ class UNetCSIROMalePelvic:
         # Final Convolution Layer
         new_node_name = "L{}_{}_FinalConv3D".format(1, 'SYN')
         new_node = Conv3D(name=new_node_name, kernel_size=1, strides=1, padding='same',
-                          filters=6, activation='softmax')(mdl_nodes.last())
+                          filters=6)(mdl_nodes.last())
         mdl_nodes.add(name=new_node_name, node=new_node)
+
+        # Create Batch Normalization Layer
+        new_node_name = "L{}_{}_FinalBN".format(1, 'SYN')
+        new_node = BatchNormalization(name=new_node_name)(mdl_nodes.last())
+        mdl_nodes.add(name=new_node_name, node=new_node)
+        # Create ReLU Layer
+        new_node_name = "L{}_{}_FinalReLU".format(1, 'SYN')
+        new_node = ReLU(name=new_node_name)(mdl_nodes.last())
+        mdl_nodes.add(name=new_node_name, node=new_node)
+
+
         # Instantiate & compile model object
         self.mdl = tf.keras.Model(inputs=mdl_input, outputs=mdl_nodes.last())
         self.mdl.compile(optimizer=self.__opt, loss=self.__loss, metrics=[f1_score], run_eagerly=True)
